@@ -1,2 +1,3 @@
 # fast-motion-estimation-algorithm
-Realisation of A Novel Search Algorithm Based on Adaptive Rood Pattern (Saeid Fazli and Leila Tavakkoli) for VirtualDub
+
+Implementation of Motion Estimation algorithm based on (Saeid Fazli and Leila Tavakkoli, 2014) for use in VirtualDub filter. MSU 2019
