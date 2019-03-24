@@ -16,13 +16,16 @@ MotionEstimator::MotionEstimator(int width, int height, uint8_t quality, bool us
 	, num_blocks_hor((width + BLOCK_SIZE - 1) / BLOCK_SIZE)
 	, num_blocks_vert((height + BLOCK_SIZE - 1) / BLOCK_SIZE)
 	, first_row_offset(width_ext * BORDER + BORDER) {
+
 	// PUT YOUR CODE HERE
 	prev_vectors = new MV[num_blocks_hor * num_blocks_vert];
+	mxvec = new int[num_blocks_hor * num_blocks_vert];
 }
 
 MotionEstimator::~MotionEstimator() {
 	// PUT YOUR CODE HERE
 	delete[] prev_vectors;
+	delete[] mxvec;
 }
 
 void MotionEstimator::Estimate(const uint8_t* cur_Y,
@@ -41,7 +44,7 @@ void MotionEstimator::Estimate(const uint8_t* cur_Y,
 		prev_map.emplace(ShiftDir::UPLEFT, prev_Y_upleft);
 	}*/
 
-	//медианная фильтрация очень медленная 
+	//Г¬ГҐГ¤ГЁГ Г­Г­Г Гї ГґГЁГ«ГјГІГ°Г Г¶ГЁГї Г®Г·ГҐГ­Гј Г¬ГҐГ¤Г«ГҐГ­Г­Г Гї 
 	/*
 	int win = 3;
 	int edge = win / 2;
@@ -69,433 +72,163 @@ void MotionEstimator::Estimate(const uint8_t* cur_Y,
 			const auto vert_offset = first_row_offset + i * BLOCK_SIZE * width_ext;
 			const auto cur = cur_Y + vert_offset + hor_offset;
 
+			const auto prev = prev_Y + vert_offset + hor_offset;
+
 			MV best_vector;
-			best_vector.error = std::numeric_limits<long>::max();
+			best_vector.x = 0;
+			best_vector.y = 0;
+			best_vector.shift_dir = ShiftDir::NONE;
+			best_vector.error = GetErrorSAD_16x16(cur, prev, width_ext);
 
-			// PUT YOUR CODE HERE
-			for (int u = 0; u < 1; u++) {
-				const auto prev = prev_Y + vert_offset + hor_offset;
-				best_vector.x = 0;
-				best_vector.y = 0;
-				best_vector.shift_dir = ShiftDir::NONE;
-				best_vector.error = GetErrorSAD_16x16(cur, prev, width_ext);
+			// Local function to shorten syntax. Returns bool: if the checked vector has smaller error
+			const int &width_local = width_ext;
+			auto verror = [&cur, &width_local, &best_vector](const uint8_t *prev, int y, int x) -> bool {
+				const uint8_t *comp = prev + y * width_local + x;
+				long elem = GetErrorSAD_16x16(cur, comp, width_local);
+				if (elem < best_vector.error) {
+					best_vector.x = x;
+					best_vector.y = y;
+					best_vector.error = elem;
+					return true;
+				}
+				return false;
+			};
 
-				if (best_vector.error < threshold) {
-					break;
+
+
+
+
+			if (best_vector.error < threshold) {
+				mvectors[block_id] = best_vector;
+				prev_vectors[block_id] = best_vector;
+				mxvec[block_id] = std::max(abs(best_vector.y), abs(best_vector.x));
+				continue;
+			}
+
+			const int block_id_up = (i - 1) * num_blocks_hor + j;
+			const int block_id_lf = i * num_blocks_hor + j - 1;
+
+			// Set step size
+			int step_size = 0;
+			if (i == 0 && j == 0) {
+				step_size = 3;
+			}
+			else {
+				int max = 0;
+				if (i > 0) {
+					max = mxvec[block_id_up];
+				}
+				if (j > 0) {
+					max = std::max(max, mxvec[block_id_lf]);
 				}
 
-				const auto block_id_up = (i - 1) * num_blocks_hor + j;
-				const auto block_id_lf = i * num_blocks_hor + j - 1;
-
-				int step_size = 0;
-				if (i == 0 && j == 0) {
-					step_size = 3;
+				if (!first && quality >= 40) {
+					step_size = std::max(abs(prev_vectors[block_id].x), abs(prev_vectors[block_id].y));
+					step_size = std::max(step_size, max);
 				}
 				else {
-					int max = 0;
-					if (i == 0) {
-						max = std::max(abs(mvectors[block_id_lf].x), abs(mvectors[block_id_lf].y));
+					step_size = max;
+				}
+			}
+
+			// Prediction by previous and current computed motion vectors
+			if (i > 0) {
+				verror(prev, mvectors[block_id_up].y, mvectors[block_id_up].x);
+			}
+			if (j > 0) {
+				verror(prev, mvectors[block_id_lf].y, mvectors[block_id_lf].x);
+			}
+			if (step_size >= 4) {
+				if (quality >= 40) {
+					if (!first) {
+						verror(prev, prev_vectors[block_id].y, prev_vectors[block_id].x);
 					}
-					else if (j == 0) {
-						max = std::max(abs(mvectors[block_id_up].x), abs(mvectors[block_id_up].y));
-					}
-					else {
-						max = std::max({ abs(mvectors[block_id_up].x), abs(mvectors[block_id_up].y), abs(mvectors[block_id_lf].x), abs(mvectors[block_id_lf].y) });
-					}
-					if (!first && quality >= 40) {
-						step_size = std::max(abs(prev_vectors[block_id].x), abs(prev_vectors[block_id].y));
-						step_size = std::max(step_size, max);
-					} 
-					else {
-						step_size = max;
+				}
+			}
+			else if (step_size >= 2) { // Step size in [2, 3]
+				int rood_y[] = { 1, 0, -1, 0 };
+				int rood_x[] = { 0, 1, 0, -1 };
+				for (int h = 0; h < 4; h++) {
+					int y = (rood_y[h] + best_vector.y) * step_size;
+					int x = (rood_x[h] + best_vector.x) * step_size;
+					if (-BORDER <= x && x <= BORDER && -BORDER <= y && y <= BORDER) {
+						verror(prev, y, x);
 					}
 				}
 
-				if (step_size >= 4) {
-					if (quality >= 40) {
-						if (!first) {
-							const auto comp = prev + prev_vectors[block_id].y * width_ext + prev_vectors[block_id].x;
-							int error = GetErrorSAD_16x16(cur, comp, width_ext);
-							if (error < best_vector.error) {
-								best_vector.x = prev_vectors[block_id].x;
-								best_vector.y = prev_vectors[block_id].y;
-								best_vector.shift_dir = ShiftDir::NONE;
-								best_vector.error = error;
-							}
-						}
-					}
-					if (!(i == 0 && j == 0)) {
-						if (i == 0) {
-							const auto comp = prev + mvectors[block_id_lf].y * width_ext + mvectors[block_id_lf].x;
-							int error = GetErrorSAD_16x16(cur, comp, width_ext);
-							if (error < best_vector.error) {
-								best_vector.x = mvectors[block_id_lf].x;
-								best_vector.y = mvectors[block_id_lf].y;
-								best_vector.shift_dir = ShiftDir::NONE;
-								best_vector.error = error;
-							}
-						}
-						else if (j == 0) {
-							const auto comp = prev + mvectors[block_id_up].y * width_ext + mvectors[block_id_up].x;
-							int error = GetErrorSAD_16x16(cur, comp, width_ext);
-							if (error < best_vector.error) {
-								best_vector.x = mvectors[block_id_up].x;
-								best_vector.y = mvectors[block_id_up].y;
-								best_vector.shift_dir = ShiftDir::NONE;
-								best_vector.error = error;
-							}
-						}
-						else {
-							const auto comp1 = prev + mvectors[block_id_up].y * width_ext + mvectors[block_id_up].x;
-							int error1 = GetErrorSAD_16x16(cur, comp1, width_ext);
-							const auto comp2 = prev + mvectors[block_id_lf].y * width_ext + mvectors[block_id_lf].x;
-							int error2 = GetErrorSAD_16x16(cur, comp2, width_ext);
-							if (error1 < best_vector.error) {
-								if (error2 < error1) {
-									best_vector.x = mvectors[block_id_lf].x;
-									best_vector.y = mvectors[block_id_lf].y;
-									best_vector.shift_dir = ShiftDir::NONE;
-									best_vector.error = error2;
-								}
-								else {
-									best_vector.x = mvectors[block_id_up].x;
-									best_vector.y = mvectors[block_id_up].y;
-									best_vector.shift_dir = ShiftDir::NONE;
-									best_vector.error = error1;
-								}
-							}
-							else {
-								if (error2 < best_vector.error) {
-									best_vector.x = mvectors[block_id_lf].x;
-									best_vector.y = mvectors[block_id_lf].y;
-									best_vector.shift_dir = ShiftDir::NONE;
-									best_vector.error = error2;
-								}
-							}
-						}
+				// extra
+				if (quality >= 60) {
+					if (!first) {
+						verror(prev, prev_vectors[block_id].y, prev_vectors[block_id].x);
 					}
 				}
-				else if (step_size >= 2) {
-					int error = 0;
-					for (int h = 0; h < 4; h++) {
-						int x = 0, y = 0;
-						switch (h) {
-						case 0:
-							y = step_size;
-							break;
-						case 1:
-							y = -step_size;
-							break;
-						case 2:
-							x = step_size;
-							break;
-						case 3:
-							x = -step_size;
-							break;
-						}
-						x += best_vector.x;
-						y += best_vector.y;
-						const auto comp = prev + y * width_ext + x;
-						error = GetErrorSAD_16x16(cur, comp, width_ext);
-						if (error < best_vector.error) {
-							best_vector.x = x;
-							best_vector.y = y;
-							best_vector.shift_dir = ShiftDir::NONE;
-							best_vector.error = error;
-						}
-					}
-					//extra
-					if ( quality >= 60) {
-						if (!first) {
-							int px = prev_vectors[block_id].x;
-							int py = prev_vectors[block_id].y;
-							auto comp = prev + py * width_ext + px;
-							error = GetErrorSAD_16x16(cur, comp, width_ext);
-							if (error < best_vector.error) {
-								best_vector.x = px;
-								best_vector.y = py;
-								best_vector.shift_dir = ShiftDir::NONE;
-								best_vector.error = error;
-							}
-						}
-						if (!(i == 0 && j == 0)) {
-							if (i == 0) {
-								auto comp = prev + mvectors[block_id_lf].y * width_ext + mvectors[block_id_lf].x;
-								error = GetErrorSAD_16x16(cur, comp, width_ext);
-								if (error < best_vector.error) {
-									best_vector.x = mvectors[block_id_lf].x;
-									best_vector.y = mvectors[block_id_lf].y;
-									best_vector.shift_dir = ShiftDir::NONE;
-									best_vector.error = error;
-								}
-							}
-							else if (j == 0) {
-								auto comp = prev + mvectors[block_id_up].y * width_ext + mvectors[block_id_up].x;
-								error = GetErrorSAD_16x16(cur, comp, width_ext);
-								if (error < best_vector.error) {
-									best_vector.x = mvectors[block_id_up].x;
-									best_vector.y = mvectors[block_id_up].y;
-									best_vector.shift_dir = ShiftDir::NONE;
-									best_vector.error = error;
-								}
-							}
-							else {
-								auto comp1 = prev + mvectors[block_id_up].y * width_ext + mvectors[block_id_up].x;
-								int error1 = GetErrorSAD_16x16(cur, comp1, width_ext);
-								auto comp2 = prev + mvectors[block_id_lf].y * width_ext + mvectors[block_id_lf].x;
-								int error2 = GetErrorSAD_16x16(cur, comp2, width_ext);
-								if (error1 < best_vector.error) {
-									if (error2 < error1) {
-										best_vector.x = mvectors[block_id_lf].x;
-										best_vector.y = mvectors[block_id_lf].y;
-										best_vector.shift_dir = ShiftDir::NONE;
-										best_vector.error = error2;
-									}
-									else {
-										best_vector.x = mvectors[block_id_up].x;
-										best_vector.y = mvectors[block_id_up].y;
-										best_vector.shift_dir = ShiftDir::NONE;
-										best_vector.error = error1;
-									}
-								}
-								else {
-									if (error2 < best_vector.error) {
-										best_vector.x = mvectors[block_id_lf].x;
-										best_vector.y = mvectors[block_id_lf].y;
-										best_vector.shift_dir = ShiftDir::NONE;
-										best_vector.error = error2;
-									}
-								}
-							}
-						}
-					}
-				}
-				bool flag = true;
-				if (quality >= 100) {
-					while (flag) {
-						flag = false;
-						for (int h = 0; h < 4; h++) {
-							int x = 0, y = 0;
-							step_size = 1;
-							switch (h) {
-							case 0:
-								y = step_size;
-								break;
-							case 1:
-								y = -step_size;
-								break;
-							case 2:
-								x = step_size;
-								break;
-							case 3:
-								x = -step_size;
-								break;
-							case 4:
-								x = step_size;
-								y = step_size;
-								break;
-							case 5:
-								x = step_size;
-								y = -step_size;
-								break;
-							case 6:
-								x = -step_size;
-								y = step_size;
-								break;
-							case 7:
-								x = -step_size;
-								y = -step_size;
-								break;
-							}
-							x += best_vector.x;
-							y += best_vector.y;
-							if (x >= BORDER || x <= -BORDER || y >= BORDER || y <= -BORDER)
-								break;
-							const auto comp = prev + y * width_ext + x;
-							int error = GetErrorSAD_16x16(cur, comp, width_ext);
-							if (error < best_vector.error) {
-								flag = true;
-								best_vector.x = x;
-								best_vector.y = y;
-								best_vector.shift_dir = ShiftDir::NONE;
-								best_vector.error = error;
-							}
-						}
-					}
-				} else if (quality >= 20) {
-					while (flag) {
-						flag = false;
-						for (int h = 0; h < 4; h++) {
-							int x = 0, y = 0;
-							step_size = 1;
-							switch (h) {
-							case 0:
-								y = step_size;
-								break;
-							case 1:
-								y = -step_size;
-								break;
-							case 2:
-								x = step_size;
-								break;
-							case 3:
-								x = -step_size;
-								break;
-							}
-							x += best_vector.x;
-							y += best_vector.y;
-							if (x >= BORDER || x <= -BORDER || y >= BORDER || y <= -BORDER)
-								break;
-							const auto comp = prev + y * width_ext + x;
-							int error = GetErrorSAD_16x16(cur, comp, width_ext);
-							if (error < best_vector.error) {
-								flag = true;
-								best_vector.x = x;
-								best_vector.y = y;
-								best_vector.shift_dir = ShiftDir::NONE;
-								best_vector.error = error;
-							}
-						}
-					}
-				}
-				else {
-					if (best_vector.error < 2 * threshold && best_vector.error > threshold) {
-						while (flag) {
-							flag = false;
-							for (int h = 0; h < 4; h++) {
-								int x = 0, y = 0;
-								step_size = 1;
-								switch (h) {
-								case 0:
-									y = step_size;
-									break;
-								case 1:
-									y = -step_size;
-									break;
-								case 2:
-									x = step_size;
-									break;
-								case 3:
-									x = -step_size;
-									break;
-								}
-								x += best_vector.x;
-								y += best_vector.y;
-								int b = BORDER / 2;
-								if (x >= b || x <= -b || y >= b || y <= -b)
-									break;
-								const auto comp = prev + y * width_ext + x;
-								int error = GetErrorSAD_16x16(cur, comp, width_ext);
-								if (error < best_vector.error) {
-									flag = true;
-									best_vector.x = x;
-									best_vector.y = y;
-									best_vector.shift_dir = ShiftDir::NONE;
-									best_vector.error = error;
-								}
-							}
+			}
+
+			// Search with step size 1
+			bool flag = true;
+
+			int search_lim = 4;
+			int border_lim = BORDER;
+			bool launch_search = true;
+
+			if (quality >= 100) {
+				search_lim = 4;
+			}
+			else if (quality >= 20) {
+				search_lim = 4;
+			}
+			else {
+				border_lim = BORDER / 2;
+				launch_search = threshold < best_vector.error && best_vector.error < 2 * threshold;
+			}
+
+			if (launch_search) {
+				while (flag) {
+					flag = false;
+					int rood_y[] = { 1, 0, -1, 0, 1, -1, -1, 1 };
+					int rood_x[] = { 0, 1, 0, -1, 1, 1, -1, -1 };
+					for (int h = 0; h < search_lim; h++) {
+						int y = rood_y[h] + best_vector.y;
+						int x = rood_x[h] + best_vector.x;
+						if (-border_lim <= x && x <= border_lim && -border_lim <= y && y <= border_lim) {
+							// verror returns and produces a side effect
+							flag |= verror(prev, y, x);
 						}
 					}
 				}
 			}
+
+
+
 
 			//halfpixel
 			if (use_half_pixel) {
 				if (j != 0) {
-					auto prev = prev_Y_up + vert_offset + hor_offset;
-					auto comp = prev + best_vector.y * width_ext + best_vector.x;
-					int error = GetErrorSAD_16x16(cur, comp, width_ext);
-					if (error < best_vector.error) {
+					const auto half_prev = prev_Y_up + vert_offset + hor_offset;
+					if (verror(half_prev, best_vector.y, best_vector.x)) {
 						best_vector.shift_dir = ShiftDir::UP;
-						best_vector.error = error;
 					}
 				}
 				if (i != 0) {
-					auto prev = prev_Y_left + vert_offset + hor_offset;
-					auto comp = prev + best_vector.y * width_ext + best_vector.x;
-					int  error = GetErrorSAD_16x16(cur, comp, width_ext);
-					if (error < best_vector.error) {
+					const auto half_prev = prev_Y_left + vert_offset + hor_offset;
+					if (verror(half_prev, best_vector.y, best_vector.x)) {
 						best_vector.shift_dir = ShiftDir::LEFT;
-						best_vector.error = error;
 					}
 				}
 				if (j != 0 && i != 0) {
-					auto prev = prev_Y_upleft + vert_offset + hor_offset;
-					auto comp = prev + best_vector.y * width_ext + best_vector.x;
-					int error = GetErrorSAD_16x16(cur, comp, width_ext);
-					if (error < best_vector.error) {
+					auto half_prev = prev_Y_upleft + vert_offset + hor_offset;
+					if (verror(half_prev, best_vector.y, best_vector.x)) {
 						best_vector.shift_dir = ShiftDir::UPLEFT;
-						best_vector.error = error;
 					}
 				}
-				/*if (j != num_blocks_hor - 1) {
-					auto prev = prev_Y_up + vert_offset + hor_offset;
-					auto comp = prev + (best_vector.y - 1) * width_ext + best_vector.x;
-					int  error = GetErrorSAD_16x16(cur, comp, width_ext);
-					if (error < best_vector.error) {
-						best_vector.y--;
-						best_vector.shift_dir = ShiftDir::UP;
-						best_vector.error = error;
-					}
-				}
-				if (i != num_blocks_vert - 1) {
-					auto prev = prev_Y_left + vert_offset + hor_offset;
-					auto comp = prev + best_vector.y * width_ext + best_vector.x - 1;
-					int  error = GetErrorSAD_16x16(cur, comp, width_ext);
-					if (error < best_vector.error) {
-						best_vector.x--;
-						best_vector.shift_dir = ShiftDir::LEFT;
-						best_vector.error = error;
-					}
-				}
-				if (quality >= 80) {
-					if (j != 0 && i != 0) {
-						auto prev = prev_Y_upleft + vert_offset + hor_offset;
-						auto comp = prev + best_vector.y * width_ext + best_vector.x;
-						int error = GetErrorSAD_16x16(cur, comp, width_ext);
-						if (error < best_vector.error) {
-							best_vector.shift_dir = ShiftDir::UPLEFT;
-							best_vector.error = error;
-						}
-					}
-					if (j != num_blocks_hor - 1) {
-						auto prev = prev_Y_upleft + vert_offset + hor_offset;
-						auto comp = prev + (best_vector.y - 1) * width_ext + best_vector.x;
-						int  error = GetErrorSAD_16x16(cur, comp, width_ext);
-						if (error < best_vector.error) {
-							best_vector.y--;
-							best_vector.shift_dir = ShiftDir::UPLEFT;
-							best_vector.error = error;
-						}
-					}
-					if (i != num_blocks_vert - 1) {
-						auto prev = prev_Y_upleft + vert_offset + hor_offset;
-						auto comp = prev + best_vector.y * width_ext + best_vector.x - 1;
-						int  error = GetErrorSAD_16x16(cur, comp, width_ext);
-						if (error < best_vector.error) {
-							best_vector.x--;
-							best_vector.shift_dir = ShiftDir::UPLEFT;
-							best_vector.error = error;
-						}
-					}
-					if (i != num_blocks_vert - 1 && j != num_blocks_hor - 1) {
-						auto prev = prev_Y_upleft + vert_offset + hor_offset;
-						auto comp = prev + (best_vector.y - 1) * width_ext + best_vector.x - 1;
-						int  error = GetErrorSAD_16x16(cur, comp, width_ext);
-						if (error < best_vector.error) {
-							best_vector.x--;
-							best_vector.y--;
-							best_vector.shift_dir = ShiftDir::UPLEFT;
-							best_vector.error = error;
-						}
-					}
-				}*/
 			}
 
 			mvectors[block_id] = best_vector;
 			prev_vectors[block_id] = best_vector;
+			mxvec[block_id] = std::max(abs(best_vector.y), abs(best_vector.x));
 		}
 	}
+
 	if (first) {
 		first = false;
 	}
