@@ -88,4 +88,6 @@ private:
 	bool first = true;
 
 	MV* prev_vectors;
+
+	int *mxvec; // Biggest vectors of current frame
 };
